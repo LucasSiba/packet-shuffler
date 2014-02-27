@@ -1,0 +1,6 @@
+[submodule "exs-util"]
+	path = exs-util
+	url = https://github.com/LucasSiba/exs-util.git
+[submodule "Option-Parse"]
+	path = Option-Parse
+	url = https://github.com/LucasSiba/Option-Parse.git
