@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -27,12 +28,16 @@
 // 6 - Debug function calls
 // 7 - Debug Internals
 
+// Parent only
+unsigned       living_children = 0;
+
 // Defaults
 unsigned short port_external   = 1337;
 const char*    ip_external     = "127.0.0.1";
 unsigned short port_internal   = 1338;
 const char*    ip_internal     = "127.0.0.1";
 unsigned       max_connections = 100000;
+unsigned       worker_count    = 1;
 
 unsigned       timeout_connecting_state = 2;
 unsigned       timeout_idle_state       = 60;
@@ -82,6 +87,7 @@ external_connection_pool* external_connections;
 internal_connection_pool* internal_connections;
 
 ev_timer per_second_timer;
+struct ev_loop *global_ev_loop;
 
 // foward declarations
 static void internal_read_cb(EV_P_ ev_io* read_ev_io, int revents);
@@ -557,7 +563,13 @@ timer_cb(EV_P_ ev_timer* timer_ev_io, int revents)
     (void)revents;
     (void)timer_ev_io;
 
+    unsigned active_connections = exs_pool_get_number_in_state(internal_connections, INT_CON_POOL_STATE_CONNECTED);
+
     check_timeouts();
+
+    if (active_connections == 0 && count_connects_sec == 0) {
+        goto SKIP_PRINTING;
+    }
 
     static int banner_count = 0;
     if (!(banner_count++ % 20)) {
@@ -575,6 +587,7 @@ timer_cb(EV_P_ ev_timer* timer_ev_io, int revents)
         count_idle_timeouts_sec
     );
 
+SKIP_PRINTING:
     count_connects_sec = 0;
     count_in_close_sec = 0;
     count_ex_close_sec = 0;
@@ -584,31 +597,105 @@ timer_cb(EV_P_ ev_timer* timer_ev_io, int revents)
     count_idle_timeouts_sec = 0;
 }
 
+static void
+exit_signal_handler(int signum)
+{
+    SXEL1("Child: exit_signal_handler(signal=%d)", signum);
+
+    if (external_connections != NULL && internal_connections != NULL) { 
+        unsigned id;
+        for (id = 0; id < max_connections; id++) {
+            if (exs_pool_index_to_state(external_connections, id) != EXT_CON_POOL_STATE_FREE) {
+                shutdown_connections(external_connections[id].internal_id, id);
+            }
+        }
+        exs_pool_del(external_connections);
+        exs_pool_del(internal_connections);
+        ev_loop_destroy(global_ev_loop);
+    }
+
+    SXEL1("Child exiting");
+    exit(0);
+}
+
+static void
+parent_signal_handler(int signum)
+{
+    SXEL1("Parent: shutting down (arg=%d)", signum);
+
+    signal(SIGTERM, SIG_IGN); // don't get re-signalled
+    signal(SIGINT,  SIG_IGN); // don't get re-signalled
+
+    killpg(0, SIGTERM);
+
+    while (living_children) {
+        wait(NULL);
+        living_children--;
+        SXEL1("Parent Child reaped, %d remaining", living_children);
+    }
+    SXEL1("Parent exiting");
+    exit(0);
+}
+
 int
 main(int argc, char * argv[])
 {
+    unsigned workers_forked;
+
     op_add('a', "port-external",   OP_UNSIGNED_SHORT, &port_external);
     op_add('b', "ip-external",     OP_CONST_CHAR_PTR, &ip_external);
     op_add('c', "port-internal",   OP_UNSIGNED_SHORT, &port_internal);
     op_add('d', "ip-internal",     OP_CONST_CHAR_PTR, &ip_internal);
     op_add('e', "max-connections", OP_UNSIGNED,       &max_connections);
+    op_add('f', "worker_count",    OP_UNSIGNED,       &worker_count);
 
     op_run(argc, argv, stdout);
 
-    struct ev_loop *loop = ev_default_loop(0);
+    // Bind to the listening port, then fork, then intialize everything else
+    ev_io listen_io;
+    add_listener(&listen_io);
+
+    setsid(); // become our own process group (makes us killpg safe)
+
+    for (workers_forked = 0; workers_forked != worker_count; workers_forked++) {
+        pid_t pid = fork();
+        switch (pid) {
+        case 0:
+            goto CHILREN_CONTINUE_HERE;
+        case -1:
+            SXEA1(0, "Forked failed!");
+        default:
+            SXEL1("Parent forked a worker: PID=%d", pid);
+            living_children++;
+        }
+    }
+
+    // Parent
+    signal(SIGINT,  parent_signal_handler);
+    signal(SIGTERM, parent_signal_handler);
+    wait(NULL);
+    living_children--;
+    SXEL1("Parent: A child has stopped unexpectedly");
+    parent_signal_handler(0); 
+
+CHILREN_CONTINUE_HERE:
+    // Children
+    signal(SIGPIPE, SIG_IGN); // Just a good idea
+    signal(SIGINT,  exit_signal_handler);
+    signal(SIGTERM, exit_signal_handler);
+
     external_connections = (external_connection_pool*) exs_pool_new("external_connections", max_connections,
                                                                     sizeof(external_connection_pool),
                                                                     EXT_CON_POOL_NUMBER_OF_STATES);
     internal_connections = (internal_connection_pool*) exs_pool_new("internal_connections", max_connections,
                                                                     sizeof(internal_connection_pool),
                                                                     INT_CON_POOL_NUMBER_OF_STATES);
+    global_ev_loop = ev_default_loop(0);
     ev_timer_init(&per_second_timer, timer_cb, 1.0, 1.0);
     ev_timer_start(EV_DEFAULT, &per_second_timer);
 
-    ev_io listen_io;
-    add_listener(&listen_io);
     SXEL6("ev_loop, run");
-    ev_loop(loop, 0);
+    ev_loop(global_ev_loop, 0);
 
     return 0;
 }
